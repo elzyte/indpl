@@ -4,141 +4,14 @@ import 'dart:async';
 import 'package:http/http.dart' as http;
 import 'dart:math';
 import 'dart:convert';
-import 'package:flutter_fortune_wheel/flutter_fortune_wheel.dart';
+import 'package:collection/collection.dart';
+import 'draw.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-void main() {
-  runApp(const MyApp());
-}
 
-Path buildSlicePath(double radius, double startAngle, double sweepAngle) {
-  Path path = Path();
-  path.moveTo(0, 0); // Start at the center of the circle
-  path.arcTo(
-    Rect.fromCircle(center: Offset(0, 0), radius: radius),
-    startAngle, // Start angle in radians
-    sweepAngle, // Angle of the slice
-    false,
-  );
-  path.close(); // Close the path to form a complete shape
-  return path;
-}
-
-class CircleSlicePainter extends CustomPainter {
-  final double startAngle;
-  final double sweepAngle;
-  final Color color;
-
-  CircleSlicePainter(this.startAngle, this.sweepAngle, this.color);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final double radius = min(size.width, size.height) / 2;
-
-    canvas.translate(size.width / 2, size.height / 2); // Move to center
-    final path = buildSlicePath(radius, startAngle, sweepAngle);
-
-    final paint = Paint()..color = color;
-    canvas.drawPath(path, paint);
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) {
-    return false;
-  }
-}
-
-class CircleSliceView extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    return CustomPaint(
-      size: Size(250, 250), // Set a size for the wheel
-      painter: CircleSlicePainter(
-          0, // Start angle (first slice starts at 0)
-          pi / 2, // Sweep angle (90 degrees, 1/4 of a full circle)
-          Colors.blue // Correctly assigned as the color
-          ),
-    );
-  }
-}
-
-class SpinningWheel extends StatelessWidget {
-  final List<String> items;
-  final List<Color> colors;
-  final double rotationAngle;
-
-  SpinningWheel(
-      {required this.items, required this.colors, required this.rotationAngle});
-
-  @override
-  Widget build(BuildContext context) {
-    double sliceAngle = (2 * pi) / items.length;
-    double wheelRadius = 125; // Half of 250x250 wheel size
-    double textRadius = wheelRadius * 0.8; // Move text closer to the outer edge
-
-    return Transform.rotate(
-      // Rotate entire wheel together
-      angle: rotationAngle,
-      child: Stack(
-        alignment: Alignment.center,
-        children: List.generate(items.length, (index) {
-          double startAngle = index * sliceAngle + pi / 4;
-          double textAngle =
-              startAngle + sliceAngle / 2; // Center text in slice
-
-          return Stack(
-            alignment: Alignment.center,
-            children: [
-              // Draw the slice
-              CustomPaint(
-                size: const Size(250, 250),
-                painter:
-                    CircleSlicePainter(startAngle, sliceAngle, colors[index]),
-              ),
-              // Position the text dynamically
-              Positioned(
-                left: 125 + textRadius * cos(textAngle), // Adjust X position
-                top: 125 + textRadius * sin(textAngle), // Adjust Y position
-                child: Transform.rotate(
-                  angle: textAngle + pi / 2, // Ensure text faces center
-                  child: CustomPaint(
-                    painter: TextPainterHelper(
-                        items[index]), // Use helper to center text
-                  ),
-                ),
-              ),
-            ],
-          );
-        }),
-      ),
-    );
-  }
-}
-
-class TextPainterHelper extends CustomPainter {
-  final String text;
-  TextPainterHelper(this.text);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final textPainter = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: const TextStyle(
-            fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
-      ),
-      textAlign: TextAlign.center,
-      textDirection: TextDirection.ltr,
-    );
-
-    textPainter.layout(); // Measure text size
-
-    // Center text properly
-    Offset textOffset = Offset(-textPainter.width / 2, -textPainter.height / 2);
-    textPainter.paint(canvas, textOffset);
-  }
-
-  @override
-  bool shouldRepaint(CustomPainter oldDelegate) => false;
+void main() async {
+  runApp(MyApp());
 }
 
 class MyApp extends StatelessWidget {
@@ -167,53 +40,86 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage>
     with SingleTickerProviderStateMixin {
-  final String espIp = "http://192.168.79.32"; // Replace with actual ESP32 IP
+  final String espIp = "http://192.168.1.84"; // Replace with actual ESP32 IP
   Timer? _timer;
   String? deviceName;
   bool isPolling = true;
+  Map<String, Color> userColors = {};
   List<Color> _wheelColors = [];
   List<String> _wheelItems = [];
+  List<String> lastUsers = [];
+
+  late FlutterLocalNotificationsPlugin localNotifications;
+
   final List<Color> _allowedColors = [
     Colors.blue,
     Colors.red,
     Colors.green,
-    Colors.yellow,
-    const Color.fromARGB(255, 235, 119, 255),
     Colors.orange,
+    Colors.yellow,
+    const Color.fromARGB(255, 235, 119, 255)
   ];
 
   late AnimationController _controller;
   late Animation<double> _rotationAnimation;
   double _currentRotation = 0; // Keeps track of current angle
+  int serverCounter = 0;
+  int lastCounter = 0;
 
   @override
   void initState() {
     super.initState();
-    _assignRandomColors(); // Generate random colors from allowed list
+
     _controller = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 800), // Smooth 90-degree animation
+      duration: const Duration(milliseconds: 800),
     );
+
     _rotationAnimation = Tween<double>(begin: 0, end: 0).animate(_controller);
+
+    _startFetchingUsers();
+    _fetchServerCounter();
     _loadDeviceName();
   }
 
-  void _assignRandomColors() {
-    if (_allowedColors.length < _wheelItems.length) {
-      throw Exception("Not enough unique colors for all slices!");
+  Future<void> _fetchServerCounter() async {
+    try {
+      final response = await http.get(
+        Uri.parse("$espIp/fetchcounter"),
+        headers: {"Accept": "application/json"},
+      );
+      if (response.statusCode == 200) {
+        print("Response received: ${response.body}");
+        Map<String, dynamic> data = jsonDecode(response.body);
+        int serverCounter = int.parse(data["counter"]);
+        setState(() {
+          print("item length ${_wheelItems.length}");
+          print("serverCounter: $serverCounter");
+          lastCounter = serverCounter;
+        });
+      }
+    } catch (e) {
+      print("Polling error: $e");
     }
+  }
 
-    List<Color> shuffledColors = List.of(_allowedColors)
-      ..shuffle(); // Shuffle colors list
-    _wheelColors = shuffledColors.sublist(
-        0, _wheelItems.length); // Pick first N unique colors
+  void _assignColors() {
+    int index = 0;
+    for (String user in _wheelItems) {
+      Color newColor = _allowedColors[index];
+      userColors[user] = newColor;
+      index++;
+    }
+    _wheelColors = _wheelItems.map((user) => userColors[user]!).toList();
+
+    print("User Colors Assigned: $userColors"); // Debugging log
   }
 
   Future<void> _sendUserName(String name) async {
     final response =
         await http.post(Uri.parse("$espIp/namecheck"), body: {"name": name});
     if (response.statusCode == 200) {
-      _loadWheelItems();
+      _startFetchingUsers();
       _startPolling();
     } else {
       print("Error: $response.statusCode");
@@ -278,6 +184,7 @@ class _MyHomePageState extends State<MyHomePage>
                       }, body: {
                         "name": enteredName
                       });
+                      _wheelItems.add(enteredName);
                       print("Response Status: ${response.statusCode}");
                       print(
                           "Response Body: ${response.body}"); // Print response body
@@ -315,7 +222,6 @@ class _MyHomePageState extends State<MyHomePage>
       setState(() {
         deviceName = name;
       });
-      _loadWheelItems();
       _startPolling();
       print("sends Username to ESP");
       //_sendUserName(name); // Send the valid name to ESP32
@@ -330,12 +236,24 @@ class _MyHomePageState extends State<MyHomePage>
       }
 
       try {
-        final response = await http.get(Uri.parse("$espIp/fetchcounter"));
+        final response = await http.get(
+          Uri.parse("$espIp/fetchcounter"),
+          headers: {"Accept": "application/json"},
+        );
         if (response.statusCode == 200) {
-          bool counterIncreased = response.body.trim() == "true";
-          if (counterIncreased) {
+          print("Response received: ${response.body}");
+          Map<String, dynamic> data =
+              jsonDecode(response.body); // Decode full JSON object
+          serverCounter = int.parse(data["counter"]);
+          print("Last counter: $lastCounter");
+          if (serverCounter > lastCounter && _wheelItems.length > 1) {
             print("Counter increased!");
-            _spinWheel(); // Call animation function
+            lastCounter++;
+            print("Last counter: $lastCounter");
+            _spinWheelLeft(); // Call animation function
+          } else if (serverCounter < lastCounter && _wheelItems.length > 1) {
+            lastCounter--;
+            _spinWheelRight();
           }
         }
       } catch (e) {
@@ -359,22 +277,88 @@ class _MyHomePageState extends State<MyHomePage>
     }
   }
 
-Future<void> _loadWheelItems() async {
-  final response = await http.get(Uri.parse("$espIp/fetchusers"));
-
-  if (response.statusCode == 200) {
-    Map<String, dynamic> data = jsonDecode(response.body); // Decode full JSON object
-    setState(() {
-      _wheelItems = List<String>.from(data["users"]); // Extract 'users' array
-    });
-  } else {
-    print("Failed to load wheel items.");
+  Future<void> _flagToDecrementCounter() async {
+    try {
+      isPolling = false;
+      print("Flagged to decrement counter");
+      final response = await http.post(Uri.parse("$espIp/decrement"));
+      if (response.statusCode == 200) {
+        print("successfully sent the flag. Full handshake.");
+      }
+      isPolling = true;
+      _startPolling();
+    } catch (e) {
+      print("Error in _flagToDecrementCounter: $e");
+    }
   }
-}
 
-  void _spinWheel() {
+  void _startFetchingUsers() {
+    Timer.periodic(Duration(seconds: 5), (timer) async {
+      await _loadWheelItems();
+    });
+  }
+
+  Future<void> _loadWheelItems() async {
+    try {
+      final response = await http.get(
+        Uri.parse("$espIp/fetchusers"),
+        headers: {"Accept": "application/json"},
+      );
+
+      if (response.statusCode == 200) {
+        print("Response received: ${response.body}");
+        Map<String, dynamic> data = jsonDecode(response.body);
+
+        List<String> newUsers =
+            List<String>.from(data["users"]); // Extract users
+        final listEquality = const ListEquality();
+
+        if (!listEquality.equals(newUsers, lastUsers)) {
+          setState(() {
+            _wheelItems = newUsers;
+            _assignColors(); // Reassign colors if needed
+
+            // Reset rotation if a new user is added
+            if (_wheelItems.isNotEmpty) {
+              _currentRotation = 0;
+              _rotationAnimation = Tween<double>(
+                begin: _currentRotation,
+                end: _currentRotation,
+              ).animate(CurvedAnimation(
+                parent: _controller,
+                curve: Curves.easeOut,
+              ));
+            }
+          });
+        }
+        lastUsers = newUsers.toList();
+      } else {
+        print("Failed to load wheel items.");
+      }
+    } catch (e) {
+      print("Error fetching wheel items: $e");
+    }
+  }
+
+  void _spinWheelLeft() {
     setState(() {
       _currentRotation +=
+          (pi * 2) / _wheelItems.length; // Ensure only 1 segment rotation
+      _rotationAnimation = Tween<double>(
+        begin: _rotationAnimation.value,
+        end: _currentRotation,
+      ).animate(CurvedAnimation(
+        parent: _controller,
+        curve: Curves.easeOut, // Smooth animation
+      ));
+    });
+
+    _controller.forward(from: 0); // Start animation smoothly
+  }
+
+  void _spinWheelRight() {
+    setState(() {
+      _currentRotation -=
           (pi * 2) / _wheelItems.length; // Ensure only 1 segment rotation
       _rotationAnimation = Tween<double>(
         begin: _rotationAnimation.value,
@@ -406,25 +390,59 @@ Future<void> _loadWheelItems() async {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
-            AnimatedBuilder(
-              animation: _rotationAnimation,
-              builder: (context, child) {
-                return SpinningWheel(
-                  items: _wheelItems,
-                  colors: _wheelColors,
-                  rotationAngle: _rotationAnimation
-                      .value, // Apply rotation only inside SpinningWheel
-                );
-              },
-            ),
+            if (_wheelItems.isNotEmpty) // Only render when items exist
+              AnimatedBuilder(
+                animation: _rotationAnimation,
+                builder: (context, child) {
+                  return SpinningWheel(
+                    items: _wheelItems,
+                    colors: _wheelColors,
+                    rotationAngle: _rotationAnimation.value,
+                  );
+                },
+              )
+            else
+              SizedBox.shrink(), // Render nothing if wheel is empty
             const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: _flagToIncrementCounter,
-              child: const Text("Spin the Wheel"),
-            ),
+            Row(mainAxisAlignment: MainAxisAlignment.center, children: <Widget>[
+              ElevatedButton(
+                onPressed: _flagToIncrementCounter, // Your function
+                style: ElevatedButton.styleFrom(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(
+                        8), // Adjust for sharp or rounded corners
+                  ),
+                  padding: const EdgeInsets.all(16), // Adjusts button size
+                  backgroundColor: Colors.grey[300], // Light grey background
+                  foregroundColor: Colors.purple, // Icon color
+                  shadowColor: Colors.grey[400], // Optional shadow effect
+                  elevation: 4, // Depth effect
+                ),
+                child: const Icon(Icons.arrow_back_ios_sharp,
+                    size: 30), // Left arrow
+              ),
+              const SizedBox(width: 10), // Space between buttons
+              ElevatedButton(
+                onPressed: _flagToDecrementCounter, // Your function
+                style: ElevatedButton.styleFrom(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(
+                        8), // Adjust for sharp or rounded corners
+                  ),
+                  padding: const EdgeInsets.all(16), // Adjusts button size
+                  backgroundColor: Colors.grey[300], // Light grey background
+                  foregroundColor: Colors.purple, // Icon color
+                  shadowColor: Colors.grey[400], // Optional shadow effect
+                  elevation: 4, // Depth effect
+                ),
+                child: const Icon(Icons.arrow_forward_ios_sharp,
+                    size: 30), // Left arrow
+              ),
+            ])
           ],
         ),
       ),
     );
   }
 }
+*/
